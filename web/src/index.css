@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  @apply bg-zinc-50 text-zinc-900 antialiased;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { @apply bg-zinc-300 rounded-full; }
+::-webkit-scrollbar-thumb:hover { @apply bg-zinc-400; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* diff 行配色 */
+.diff-add { @apply bg-emerald-50; }
+.diff-del { @apply bg-red-50; }
+.diff-add-marker { @apply text-emerald-600; }
+.diff-del-marker { @apply text-red-500; }
+
+/* 代码高亮简化（keyword/string/comment/comment 基础着色） */
+.code-keyword { @apply text-purple-700; }
+.code-string { @apply text-emerald-700; }
+.code-comment { @apply text-zinc-400 italic; }
+.code-number { @apply text-blue-700; }
