@@ -14,18 +14,26 @@ import { parseJson } from './db.js'
  * - 目录前缀：`src` 或 `src/` 等价于 `src/**`（匹配其下所有文件）
  */
 
+export interface NotifyConfig {
+  enabled: boolean
+  url: string      // ntfy 服务器地址
+  topic: string    // 推送主题
+}
+
 export interface ScanConfig {
   include: string[]
   exclude: string[]
   allowlist: string[]
   maxFiles: number
+  notify: NotifyConfig
 }
 
 export const DEFAULT_SCAN_CONFIG: ScanConfig = {
   include: [],
   exclude: [],
   allowlist: [],
-  maxFiles: 40
+  maxFiles: 40,
+  notify: { enabled: false, url: 'http://localhost:8090', topic: 'code-sentinel' }
 }
 
 export type PathClass = 'excluded' | 'allowlisted' | 'scan'
@@ -43,11 +51,17 @@ export function normalizeScanConfig(input: unknown): ScanConfig {
       ? v.map((x) => String(x).trim()).filter((x) => x && !x.startsWith('#'))
       : []
   const maxFiles = Number(o.maxFiles)
+  const n = (o.notify ?? {}) as Partial<NotifyConfig>
   return {
     include: arr(o.include),
     exclude: arr(o.exclude),
     allowlist: arr(o.allowlist),
-    maxFiles: Number.isFinite(maxFiles) ? Math.min(200, Math.max(1, Math.floor(maxFiles))) : DEFAULT_SCAN_CONFIG.maxFiles
+    maxFiles: Number.isFinite(maxFiles) ? Math.min(200, Math.max(1, Math.floor(maxFiles))) : DEFAULT_SCAN_CONFIG.maxFiles,
+    notify: {
+      enabled: n.enabled === true,
+      url: (n.url || DEFAULT_SCAN_CONFIG.notify.url).replace(/\/+$/, ''),
+      topic: (n.topic || DEFAULT_SCAN_CONFIG.notify.topic).replace(/[^a-zA-Z0-9_-]/g, '-')
+    }
   }
 }
 

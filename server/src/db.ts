@@ -76,6 +76,18 @@ CREATE TABLE IF NOT EXISTS fix_tasks (
   finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fixes_scan ON fix_tasks(scan_id);
+
+-- 问题豁免记录（wont_fix 跨扫描持久化：指纹匹配的新问题自动带过）
+CREATE TABLE IF NOT EXISTS issue_waivers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL,      -- r:<file>:<rule_ids> | a:<file>:<title>
+  file_path TEXT NOT NULL,
+  title TEXT NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  UNIQUE(project_id, fingerprint)
+);
 `)
 
 // migration：项目级扫描配置（include / exclude / allowlist / maxFiles）

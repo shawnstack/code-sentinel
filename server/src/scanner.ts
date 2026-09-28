@@ -1,17 +1,21 @@
 import { db } from './db.js'
+import path from 'node:path'
 import * as G from './git.js'
 import { parseUnifiedDiff, type DiffFile } from './diff.js'
 import { listRules, matchRulesForFile, type Rule } from './rules.js'
 import { extractExports, findReferences, isTextFile } from './refs.js'
 import { chat, extractJson } from './ai.js'
 import { classifyPath, parseScanConfig, type ScanConfig } from './scanconfig.js'
+import { issueFingerprint, isWaived, IGNORE_RE } from './waive.js'
 
 /**
  * 扫描引擎：
  * 1. 三种入口（branch / commits / workdir）计算 diff，应用项目扫描配置（include / exclude / allowlist / maxFiles）
- * 2. 触发器确定性命中 → rule_match issue（bad_case / rule）
+ * 2. 触发器确定性命中 → rule_match issue（bad_case / rule）；命中行带 codescan-ignore 注释则跳过
  * 3. 逐文件调用 AI 评审（注入规则库、blame 作者、引用影响面）→ ai_found issue
- * 4. 全程逐文件进度写入 stats.progress（前端实时展示），单文件失败不中断，支持随时取消（保留已完成部分）
+ * 4. 问题落库时匹配历史豁免（wont_fix 指纹）自动带过
+ * 5. 全程逐文件进度写入 stats.progress（前端实时展示），单文件失败不中断，支持随时取消（保留已完成部分）
+ * 6. 扫描结束按配置推送 ntfy 通知
  */
 
 const MAX_FILE_CHARS = 30_000
@@ -25,6 +29,7 @@ interface ScanRow {
   base_ref: string | null
   head_ref: string | null
   status: string
+  title?: string | null
   project_path?: string
   project_scan_config?: string | null
 }
@@ -51,7 +56,7 @@ interface FileProgress {
 
 const insIssue = db.prepare(`
   INSERT INTO issues (scan_id, file_path, line_new, severity, title, description, suggestion, rule_ids, source, author, blame_date, status, confidence)
-  VALUES (@scan_id, @file_path, @line_new, @severity, @title, @description, @suggestion, @rule_ids, @source, @author, @blame_date, 'open', @confidence)
+  VALUES (@scan_id, @file_path, @line_new, @severity, @title, @description, @suggestion, @rule_ids, @source, @author, @blame_date, @status, @confidence)
 `)
 
 function setScan(scanId: number, fields: Record<string, unknown>) {
@@ -111,6 +116,8 @@ export async function runScan(scanId: number): Promise<void> {
       issues: 0,
       excluded: collectExcludedHint,
       exempted: files.filter((f) => f.exempt).length,
+      waived: 0,            // 命中历史 wont_fix 豁免
+      ignoredByComment: 0,  // 命中行内 codescan-ignore 注释
       aiErrors: [] as string[],
       rules: rules.length,
       progress: [] as FileProgress[]
@@ -119,6 +126,8 @@ export async function runScan(scanId: number): Promise<void> {
     persist()
 
     const progressOf = (file: string): FileProgress | undefined => stats.progress.find((p) => p.file === file)
+
+    const projectId = scan.project_id
 
     await runPool(
       files,
@@ -146,6 +155,8 @@ export async function runScan(scanId: number): Promise<void> {
               pr.issues = patch?.fileIssues
             }
             if (patch?.issues != null) stats.issues = patch.issues
+            if (patch?.waived) stats.waived += patch.waived
+            if (patch?.ignored) stats.ignoredByComment += patch.ignored
             persist()
           })
         } catch (e) {
@@ -165,16 +176,57 @@ export async function runScan(scanId: number): Promise<void> {
     )
 
     const canceled = ac.signal.aborted
+    const finalStatus = canceled ? 'canceled' : 'done'
     setScan(scanId, {
-      status: canceled ? 'canceled' : 'done',
+      status: finalStatus,
       finished_at: new Date().toISOString(),
       stats: JSON.stringify({ ...stats, durationMs: Date.now() - started, canceled })
     })
+    notifyScanResult(scan, repo, config, finalStatus, JSON.stringify({ ...stats, durationMs: Date.now() - started }))
   } catch (e) {
     setScan(scanId, { status: 'error', error: (e as Error).message, finished_at: new Date().toISOString() })
+    notifyScanResult(scan, scan.project_path ?? '', parseScanConfig(scan.project_scan_config), 'error', null, (e as Error).message)
   } finally {
     activeAborts.delete(scanId)
   }
+}
+
+/** 扫描结束推送 ntfy 通知（失败静默，不阻塞扫描状态） */
+function notifyScanResult(
+  scan: ScanRow,
+  repo: string,
+  config: ScanConfig,
+  status: 'done' | 'canceled' | 'error',
+  statsJson: string | null,
+  errMsg?: string
+): void {
+  if (!config.notify?.enabled) return
+  let stats: { issues?: number; done?: number; total?: number; waived?: number } = {}
+  try {
+    stats = statsJson ? JSON.parse(statsJson) : {}
+  } catch {
+    /* ignore */
+  }
+  const name = path.basename(repo) || `项目 #${scan.project_id}`
+  const statusLabel = status === 'done' ? '✅ 扫描完成' : status === 'canceled' ? '⏹ 已停止' : '❌ 扫描失败'
+  const lines = [`${statusLabel} · ${name}`, scan.title ?? `扫描 #${scan.id}`]
+  if (status === 'error') {
+    lines.push(errMsg?.slice(0, 200) ?? '未知错误')
+  } else {
+    lines.push(
+      `发现 ${stats.issues ?? 0} 个问题（评审 ${stats.done ?? 0}/${stats.total ?? '?'} 文件${
+        stats.waived ? `，${stats.waived} 个命中历史豁免` : ''
+      }）`
+    )
+  }
+  fetch(`${config.notify.url}/${config.notify.topic}`, {
+    method: 'POST',
+    body: lines.join('\n'),
+    headers: { Title: 'Code Sentinel' },
+    signal: AbortSignal.timeout(8000)
+  }).catch(() => {
+    /* 通知失败静默 */
+  })
 }
 
 /** collectDiffFiles 回传的排除文件数（fire-and-forget 单任务执行，模块级暂存可接受） */
@@ -294,7 +346,7 @@ async function reviewFile(
   df: DiffFile,
   rules: Rule[],
   signal: AbortSignal,
-  onProgress: (patch?: { issues: number; fileIssues: number }) => void
+  onProgress: (patch?: { issues: number; fileIssues: number; waived: number; ignored: number }) => void
 ) {
   const { contextRules, hardHits } = matchRulesForFile(rules, df)
   const readRef = scan.type === 'workdir' ? null : scan.head_ref || 'HEAD'
@@ -309,15 +361,35 @@ async function reviewFile(
     }
   }
 
+  // ---- 行内豁免注释：新增行含 codescan-ignore 的行号集合 ----
+  const ignoreLines = new Set<number>()
+  for (const h of df.hunks) {
+    for (const l of h.lines) {
+      if (l.type === 'add' && l.newLine != null && IGNORE_RE.test(l.content)) ignoreLines.add(l.newLine)
+    }
+  }
+
+  let waivedCount = 0
+  let ignoredCount = 0
+
   // ---- 触发器确定性命中 → rule_match issue ----
   const insertedHard = new Map<string, number>() // ruleId -> issueId
   for (const hit of hardHits) {
     if (hit.rule.type === 'good_case') continue // good_case 只做上下文，不生成问题
-    const line = hit.lines[0] ?? null
+    const kept = hit.lines.filter((n) => !ignoreLines.has(n))
+    if (kept.length === 0) {
+      ignoredCount++ // 命中行全部带 codescan-ignore 注释
+      continue
+    }
+    const line = kept[0]
     const b = line != null ? blameMap.get(line) : undefined
     const examples = hit.rule.examples?.bad
       ? `\n\nbad 示例：\n${hit.rule.examples.bad}${hit.rule.examples?.good ? `\n\ngood 示例：\n${hit.rule.examples.good}` : ''}`
       : ''
+    const ruleIdsJson = JSON.stringify([hit.rule.id])
+    const fp = issueFingerprint(df.path, 'rule_match', [hit.rule.id], hit.rule.name)
+    const waived = isWaived(scan.project_id, fp)
+    if (waived) waivedCount++
     const r = insIssue.run({
       scan_id: scanId,
       file_path: df.path,
@@ -325,14 +397,15 @@ async function reviewFile(
       severity: hit.rule.severity,
       title: `[${hit.rule.type === 'bad_case' ? 'Bad Case 命中' : '规则命中'}] ${hit.rule.name}`,
       description:
-        `${hit.reason}\n\n规则说明：${hit.rule.description || '（无描述）'}${examples}\n\n命中行：${hit.lines.join(', ')}`,
+        `${hit.reason}\n\n规则说明：${hit.rule.description || '（无描述）'}${examples}\n\n命中行：${kept.join(', ')}`,
       suggestion: hit.rule.examples?.good
         ? `参考 good 示例：\n${hit.rule.examples.good}`
         : '参照规则说明调整代码。',
-      rule_ids: JSON.stringify([hit.rule.id]),
+      rule_ids: ruleIdsJson,
       source: 'rule_match',
       author: b?.author ?? null,
       blame_date: b?.date ?? null,
+      status: waived ? 'wont_fix' : 'open',
       confidence: 'high'
     })
     insertedHard.set(hit.rule.id, Number(r.lastInsertRowid))
@@ -365,6 +438,11 @@ async function reviewFile(
     const sev = validSev.has(String(it.severity)) ? String(it.severity) : 'minor'
     let line = typeof it.line === 'number' && it.line > 0 ? Math.floor(it.line) : null
     if (line != null && line > totalLines + 50) line = null // 明显越界则不锚定
+    // 行内豁免注释：问题所在行带 codescan-ignore 则跳过
+    if (line != null && ignoreLines.has(line)) {
+      ignoredCount++
+      continue
+    }
     const rids = (it.rule_ids ?? []).filter((r) => ruleIds.has(r))
 
     // 若与触发器命中的 issue 同规则，视为确认，跳过重复
@@ -373,19 +451,25 @@ async function reviewFile(
     // 简单去重：同文件同标题已存在
     if (existRows.some((x) => x.file_path === df.path && x.title === it.title)) continue
 
+    const title = String(it.title ?? '未命名问题').slice(0, 300)
+    const fp = issueFingerprint(df.path, 'ai_found', rids.length ? rids : null, title)
+    const waived = isWaived(scan.project_id, fp)
+    if (waived) waivedCount++
+
     const b = line != null ? blameMap.get(line) : undefined
     insIssue.run({
       scan_id: scanId,
       file_path: df.path,
       line_new: line,
       severity: sev,
-      title: String(it.title ?? '未命名问题').slice(0, 300),
+      title,
       description: String(it.description ?? ''),
       suggestion: it.suggestion ? String(it.suggestion) : null,
       rule_ids: rids.length ? JSON.stringify(rids) : null,
       source: 'ai_found',
       author: b?.author ?? null,
       blame_date: b?.date ?? null,
+      status: waived ? 'wont_fix' : 'open',
       confidence: ['high', 'medium', 'low'].includes(String(it.confidence)) ? String(it.confidence) : 'medium'
     })
     added++
@@ -393,7 +477,7 @@ async function reviewFile(
 
   const totalIssues = (db.prepare('SELECT COUNT(*) c FROM issues WHERE scan_id = ?').get(scanId) as { c: number }).c
   if (aiError) stats_pushAiError(scanId, `${df.path}: ${aiError.slice(0, 200)}`)
-  onProgress({ issues: totalIssues, fileIssues: insertedHard.size + added })
+  onProgress({ issues: totalIssues, fileIssues: insertedHard.size + added, waived: waivedCount, ignored: ignoredCount })
   return added
 }
 

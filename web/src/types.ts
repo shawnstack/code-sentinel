@@ -7,6 +7,9 @@ export interface Project {
   created_at: string
   scan_count?: number
   last_scan_at?: string | null
+  last_scan_status?: string | null
+  open_issues?: number
+  waiver_count?: number
 }
 
 export interface BranchInfo {
@@ -53,6 +56,14 @@ export interface ScanStats {
   excluded?: number
   exempted?: number
   canceled?: boolean
+  waived?: number
+  ignoredByComment?: number
+}
+
+export interface NotifyConfig {
+  enabled: boolean
+  url: string
+  topic: string
 }
 
 export interface ScanConfig {
@@ -60,6 +71,17 @@ export interface ScanConfig {
   exclude: string[]
   allowlist: string[]
   maxFiles: number
+  notify: NotifyConfig
+}
+
+export interface Waiver {
+  id: number
+  project_id: number
+  fingerprint: string
+  file_path: string
+  title: string
+  reason: string | null
+  created_at: string
 }
 
 export interface ScanListItem {

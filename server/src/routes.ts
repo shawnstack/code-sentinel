@@ -11,6 +11,7 @@ import { runFix, mergeFix, discardFix } from './fixer.js'
 import { chat } from './ai.js'
 import { listTextFiles, extractExports, findReferences } from './refs.js'
 import { parseScanConfig, normalizeScanConfig } from './scanconfig.js'
+import { addWaiver, removeWaiver, listWaivers, fingerprintOfRow } from './waive.js'
 import { WEB_DIST } from './config.js'
 
 export const api = express.Router()
@@ -42,7 +43,10 @@ api.get(
     const rows = db
       .prepare(
         `SELECT p.*, (SELECT COUNT(*) FROM scans s WHERE s.project_id = p.id) scan_count,
-                (SELECT MAX(s.created_at) FROM scans s WHERE s.project_id = p.id) last_scan_at
+                (SELECT MAX(s.created_at) FROM scans s WHERE s.project_id = p.id) last_scan_at,
+                (SELECT s.status FROM scans s WHERE s.project_id = p.id ORDER BY s.id DESC LIMIT 1) last_scan_status,
+                (SELECT COUNT(*) FROM issues i WHERE i.scan_id = (SELECT MAX(s2.id) FROM scans s2 WHERE s2.project_id = p.id) AND i.status = 'open') open_issues,
+                (SELECT COUNT(*) FROM issue_waivers w WHERE w.project_id = p.id) waiver_count
          FROM projects p ORDER BY p.id`
       )
       .all()
@@ -240,10 +244,121 @@ api.get(
 api.patch(
   '/issues/:id',
   wrap(async (req, res) => {
-    const { status } = req.body as { status?: string }
+    const { status, reason } = req.body as { status?: string; reason?: string }
     if (!['open', 'resolved', 'wont_fix'].includes(status ?? '')) throw new Error('非法 status')
-    db.prepare('UPDATE issues SET status = ? WHERE id = ?').run(status, Number(req.params.id))
+    const id = Number(req.params.id)
+    const row = db
+      .prepare('SELECT i.*, s.project_id FROM issues i JOIN scans s ON s.id = i.scan_id WHERE i.id = ?')
+      .get(id) as { file_path: string; source: string; rule_ids: string | null; title: string; status: string; project_id: number } | undefined
+    if (!row) throw new Error('问题不存在')
+    db.prepare('UPDATE issues SET status = ? WHERE id = ?').run(status, id)
+
+    // 豁免联动：wont_fix 记录指纹（下次扫描自动带过）；重新打开则撤销豁免
+    const fp = fingerprintOfRow(row)
+    if (status === 'wont_fix') addWaiver(row.project_id, fp, row.file_path, row.title, reason ?? null)
+    else if (status === 'open' && row.status === 'wont_fix') removeWaiver(row.project_id, fp)
     res.json({ ok: true })
+  })
+)
+
+// 项目豁免清单（历史 wont_fix 记录）
+api.get(
+  '/projects/:id/waivers',
+  wrap(async (req, res) => {
+    const p = projectOf(req)
+    res.json(listWaivers(p.id))
+  })
+)
+
+// 撤销豁免记录
+api.delete(
+  '/waivers/:id',
+  wrap(async (req, res) => {
+    db.prepare('DELETE FROM issue_waivers WHERE id = ?').run(Number(req.params.id))
+    res.json({ ok: true })
+  })
+)
+
+// 扫描报告导出（Markdown）
+api.get(
+  '/scans/:id/report',
+  wrap(async (req, res) => {
+    const scanId = Number(req.params.id)
+    const scan = db.prepare('SELECT * FROM scans WHERE id = ?').get(scanId) as
+      | Record<string, unknown>
+      | undefined
+    if (!scan) throw new Error('扫描不存在')
+    const project = db.prepare('SELECT name FROM projects WHERE id = ?').get(scan.project_id) as { name: string }
+    const issues = db
+      .prepare("SELECT * FROM issues WHERE scan_id = ? AND status != 'wont_fix' ORDER BY severity, file_path, line_new")
+      .all(scanId) as Record<string, unknown>[]
+    const stats = (() => {
+      try {
+        return JSON.parse(String(scan.stats ?? '{}')) as Record<string, unknown>
+      } catch {
+        return {}
+      }
+    })()
+
+    const SEV_LABEL: Record<string, string> = { bug: 'Bug', major: '主要', important: '重要', minor: '轻微', style: '风格' }
+    const SEV_ORDER = ['bug', 'major', 'important', 'minor', 'style']
+    const statusLabel: Record<string, string> = { done: '完成', canceled: '已取消', error: '失败', running: '进行中', pending: '等待中' }
+
+    const md: string[] = []
+    md.push(`# 代码评审报告 · ${project.name}`)
+    md.push('')
+    md.push(`- **扫描**：${scan.title}（#${scanId}）`)
+    md.push(`- **类型**：${scan.type === 'branch' ? '分支对比' : scan.type === 'commits' ? '提交范围' : '工作区改动'}`)
+    md.push(`- **状态**：${statusLabel[String(scan.status)] ?? scan.status}`)
+    md.push(`- **时间**：${scan.created_at}`)
+    if (stats.files != null) {
+      md.push(
+        `- **范围**：${stats.files} 文件（+${stats.additions ?? 0}/−${stats.deletions ?? 0}），${stats.rules ?? 0} 条规则${
+          stats.waived ? `，${stats.waived} 个命中历史豁免` : ''
+        }${stats.ignoredByComment ? `，${stats.ignoredByComment} 个被行内注释豁免` : ''}`
+      )
+    }
+    if (scan.status === 'error') md.push(`- **错误**：${scan.error}`)
+
+    const open = issues.filter((i) => i.status === 'open')
+    const resolved = issues.filter((i) => i.status === 'resolved')
+    md.push(`- **结果**：${open.length} 个待处理，${resolved.length} 个已解决（豁免项不列出）`)
+
+    if (open.length === 0 && resolved.length === 0) {
+      md.push('')
+      md.push('🎉 未发现问题。')
+    }
+    for (const sev of SEV_ORDER) {
+      const group = open.filter((i) => i.severity === sev)
+      if (!group.length) continue
+      md.push('')
+      md.push(`## ${SEV_LABEL[sev]}（${group.length}）`)
+      for (const i of group) {
+        const loc = `${i.file_path}${i.line_new != null ? `:${i.line_new}` : ''}`
+        md.push('')
+        md.push(`### [${SEV_LABEL[sev]}] ${i.title}`)
+        md.push(`- 位置：\`${loc}\``)
+        md.push(`- 来源：${i.source === 'rule_match' ? '规则触发器命中' : 'AI 发现'}${i.author ? ` · 最后修改 ${i.author}` : ''}${i.confidence ? ` · 置信度 ${i.confidence}` : ''}`)
+        if (i.rule_ids) {
+          try {
+            const rids = JSON.parse(String(i.rule_ids)) as string[]
+            if (rids.length) md.push(`- 触犯规则：${rids.join(', ')}`)
+          } catch { /* ignore */ }
+        }
+        if (i.description) {
+          md.push('')
+          md.push(String(i.description))
+        }
+        if (i.suggestion) {
+          md.push('')
+          md.push(`> **修改建议**：${i.suggestion}`)
+        }
+      }
+    }
+
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="codescan-report-${scanId}.md"`)
+    res.send(md.join('\n'))
   })
 )
 

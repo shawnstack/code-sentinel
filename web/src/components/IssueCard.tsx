@@ -8,17 +8,25 @@ export default function IssueCard({
   rules,
   selected,
   onToggleSelect,
-  onStatus
+  onStatus,
+  onSaveRule
 }: {
   issue: Issue
   rules: Rule[]
   selected: boolean
   onToggleSelect: () => void
-  onStatus: (status: string) => void
+  onStatus: (status: string, reason?: string) => void
+  onSaveRule?: (issue: Issue) => void
 }) {
   const [showRule, setShowRule] = useState<string | null>(null)
   const ruleIds: string[] = issue.rule_ids ? JSON.parse(issue.rule_ids) : []
   const relatedRules = rules.filter((r) => ruleIds.includes(r.id))
+
+  const markWontFix = () => {
+    const reason = prompt('标记「不改」并将豁免（下次扫描该问题自动带过）。\n可填写原因（可留空）：') ?? ''
+    if (reason === null) return
+    onStatus('wont_fix', reason || undefined)
+  }
 
   return (
     <div className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm">
@@ -48,6 +56,15 @@ export default function IssueCard({
         <span className="ml-auto flex items-center gap-2">
           {issue.status === 'open' ? (
             <>
+              {onSaveRule && (
+                <button
+                  onClick={() => onSaveRule(issue)}
+                  className="rounded border border-zinc-200 px-2 py-0.5 text-[11px] text-zinc-500 hover:border-blue-300 hover:text-blue-600"
+                  title="把这个问题沉淀为规则（bad_case / rule），下次确定性命中，不依赖 AI"
+                >
+                  ⬇ 沉淀为规则
+                </button>
+              )}
               <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-zinc-600">
                 <input type="checkbox" checked={selected} onChange={onToggleSelect} className="accent-zinc-800" />
                 加入 AI 修复
@@ -55,13 +72,13 @@ export default function IssueCard({
               <button onClick={() => onStatus('resolved')} className="rounded border border-zinc-200 px-2 py-0.5 text-[11px] text-zinc-500 hover:border-emerald-300 hover:text-emerald-600">
                 已解决
               </button>
-              <button onClick={() => onStatus('wont_fix')} className="rounded border border-zinc-200 px-2 py-0.5 text-[11px] text-zinc-500 hover:border-zinc-300 hover:text-zinc-700">
-                不改
+              <button onClick={markWontFix} className="rounded border border-zinc-200 px-2 py-0.5 text-[11px] text-zinc-500 hover:border-zinc-300 hover:text-zinc-700">
+                不改（豁免）
               </button>
             </>
           ) : (
             <span className="rounded bg-zinc-100 px-2 py-0.5 text-[11px] text-zinc-500">
-              {issue.status === 'resolved' ? '已解决' : '标记不改'}
+              {issue.status === 'resolved' ? '已解决' : '标记不改（已豁免，下次扫描自动带过）'}
               <button onClick={() => onStatus('open')} className="ml-2 text-zinc-400 underline hover:text-zinc-700">
                 撤销
               </button>

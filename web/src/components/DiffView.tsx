@@ -11,10 +11,12 @@ export interface DiffViewProps {
   rules: Rule[]
   selectedIds: Set<number>
   onToggleSelect: (id: number) => void
-  onIssueStatus: (id: number, status: string) => void
+  onIssueStatus: (id: number, status: string, reason?: string) => void
   collapsed: boolean
   /** 外部要求定位的文件+行（问题列表跳转用），传新对象触发一次定位 */
   focus?: { file: string; line: number | null; seq: number } | null
+  /** 沉淀为规则入口（透传给 IssueCard） */
+  onSaveRule?: (issue: Issue) => void
 }
 
 const STATUS_LABEL: Record<DiffFile['status'], { text: string; cls: string }> = {
@@ -46,7 +48,8 @@ function FileDiff({
   onToggleSelect,
   onIssueStatus,
   collapsed,
-  focus
+  focus,
+  onSaveRule
 }: DiffViewProps & { file: DiffFile }) {
   const [open, setOpen] = useState(!collapsed)
   const [expandedLines, setExpandedLines] = useState<Set<string>>(() => {
@@ -164,7 +167,8 @@ function FileDiff({
                                   rules={rules}
                                   selected={selectedIds.has(it.id)}
                                   onToggleSelect={() => onToggleSelect(it.id)}
-                                  onStatus={(s) => onIssueStatus(it.id, s)}
+                                  onStatus={(s, reason) => onIssueStatus(it.id, s, reason)}
+                                  onSaveRule={onSaveRule}
                                 />
                               </td>
                             </tr>

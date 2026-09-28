@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
-import { apiGet, apiPatch, apiPost, errMessage } from '../api'
+import { apiGet, apiPatch, apiPost, apiPut, errMessage } from '../api'
 import type { DiffFile, FixTask, Issue, Rule, Scan, ScanStats } from '../types'
 import { SEVERITIES, SEVERITY_LABEL, timeAgo } from '../severity'
 import { ErrorText, SeverityBadge, Spinner, StatusBadge } from '../components/ui'
@@ -30,6 +30,7 @@ export default function Review() {
   const [stopBusy, setStopBusy] = useState(false)
   const [expanded, setExpanded] = useState<number | null>(null)
   const [focus, setFocus] = useState<{ file: string; line: number | null; seq: number } | null>(null)
+  const [ruleIssue, setRuleIssue] = useState<Issue | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
 
   const load = () =>
@@ -113,10 +114,13 @@ export default function Review() {
     setSelectedFix(next)
   }
 
-  const setIssueStatus = async (issueId: number, status: string) => {
-    await apiPatch(`/api/issues/${issueId}`, { status }).catch((e) => alert(errMessage(e)))
+  const setIssueStatus = async (issueId: number, status: string, reason?: string) => {
+    await apiPatch(`/api/issues/${issueId}`, { status, reason }).catch((e) => alert(errMessage(e)))
     load()
   }
+
+  /** 沉淀为规则成功后刷新规则列表（弹窗内部处理提交） */
+  const reloadRules = () => apiGet<Rule[]>(`/api/projects/${id}/rules`).then(setRules).catch(() => undefined)
 
   const createFix = async () => {
     if (selectedFix.size === 0) return
@@ -181,8 +185,19 @@ export default function Review() {
             <span className="text-red-500">−{stats.deletions ?? 0}</span> · {stats.rules ?? 0} 条规则
             {stats.excluded ? ` · 已排除 ${stats.excluded}` : ''}
             {stats.exempted ? ` · 已豁免 ${stats.exempted}` : ''}
+            {stats.waived ? ` · 命中历史豁免 ${stats.waived}` : ''}
+            {stats.ignoredByComment ? ` · 行注释豁免 ${stats.ignoredByComment}` : ''}
             {stats.durationMs ? ` · ${(stats.durationMs / 1000).toFixed(1)}s` : ''}
           </span>
+        )}
+        {canFix && (
+          <a
+            href={`/api/scans/${scanId}/report`}
+            className={running ? 'hidden' : 'ml-auto rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-xs text-zinc-600 hover:border-zinc-400'}
+            title="导出 Markdown 评审报告"
+          >
+            ⬇ 导出报告
+          </a>
         )}
         {running && (
           <button
@@ -347,6 +362,7 @@ export default function Review() {
           onToggleSelect={toggleFixSel}
           onIssueStatus={setIssueStatus}
           onGotoDiff={gotoDiff}
+          onSaveRule={setRuleIssue}
           running={running}
           foundSoFar={stats?.issues ?? 0}
         />
@@ -365,6 +381,7 @@ export default function Review() {
             onIssueStatus={setIssueStatus}
             collapsed={false}
             focus={focus}
+            onSaveRule={setRuleIssue}
           />
           {cleanFiles > 0 && (
             <div className="mt-2 text-center text-xs text-zinc-400">
@@ -408,6 +425,179 @@ export default function Review() {
           </div>
         </div>
       )}
+
+      {/* 沉淀为规则弹窗 */}
+      {ruleIssue && (
+        <SaveRuleModal
+          issue={ruleIssue}
+          files={files}
+          projectId={Number(id)}
+          existingIds={new Set(rules.map((r) => r.id))}
+          onClose={() => setRuleIssue(null)}
+          onSaved={() => {
+            setRuleIssue(null)
+            reloadRules()
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+/** 把 AI 发现 / 规则命中的问题沉淀为项目规则（.codescan/rules/*.yaml） */
+function SaveRuleModal({
+  issue,
+  files,
+  projectId,
+  existingIds,
+  onClose,
+  onSaved
+}: {
+  issue: Issue
+  files: DiffFile[]
+  projectId: number
+  existingIds: Set<string>
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const hitLine = useMemo(() => {
+    const f = files.find((x) => x.path === issue.file_path)
+    if (!f) return ''
+    for (const h of f.hunks) {
+      for (const l of h.lines) {
+        if (l.newLine === issue.line_new) return l.content.trim()
+      }
+    }
+    return ''
+  }, [files, issue])
+
+  const slug = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40)
+
+  const [id, setId] = useState(slug(issue.title) || `issue-${issue.id}`)
+  const [type, setType] = useState<'bad_case' | 'rule'>(issue.source === 'rule_match' ? 'bad_case' : 'rule')
+  const [name, setName] = useState(issue.title.replace(/^\[[^\]]+\]\s*/, '').slice(0, 60))
+  const [severity, setSeverity] = useState(issue.severity)
+  const [symbols, setSymbols] = useState('')
+  const [description, setDescription] = useState(
+    `${issue.description.slice(0, 500)}\n\n（沉淀自扫描问题：${issue.file_path}${issue.line_new != null ? `:${issue.line_new}` : ''}）`
+  )
+  const [bad, setBad] = useState(hitLine)
+  const [good, setGood] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const save = async () => {
+    if (!id.trim()) return setError('规则 id 必填（小写字母/数字/-）')
+    if (existingIds.has(id.trim())) return setError(`规则 id "${id.trim()}" 已存在`)
+    if (!name.trim()) return setError('名称必填')
+    setBusy(true)
+    setError('')
+    try {
+      await apiPut(`/api/projects/${projectId}/rules`, {
+        id: id.trim(),
+        type,
+        name: name.trim(),
+        description: description.trim(),
+        severity,
+        enabled: true,
+        trigger: {
+          symbols: symbols
+            .split(/[,，\s]+/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+        },
+        ...(bad.trim() || good.trim() ? { examples: { bad: bad.trim() || undefined, good: good.trim() || undefined } } : {})
+      })
+      onSaved()
+    } catch (e) {
+      setError(errMessage(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const input = 'w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm outline-none focus:border-zinc-500'
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div
+        className="max-h-[88vh] w-full max-w-xl overflow-y-auto rounded-xl bg-white p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-1 text-base font-semibold text-zinc-800">沉淀为规则</div>
+        <p className="mb-4 text-xs leading-relaxed text-zinc-400">
+          保存到项目 <code className="rounded bg-zinc-100 px-1">.codescan/rules/{id || '<id>'}.yaml</code>。
+          填写触发器符号后，同类问题下次由触发器确定性命中（不再依赖 AI、不耗 token）。
+        </p>
+
+        <div className="grid gap-3">
+          <div className="flex gap-3">
+            <label className="flex-1 text-xs text-zinc-500">
+              规则 id
+              <input value={id} onChange={(e) => setId(e.target.value)} placeholder="no-eval" className={`mt-1 font-mono ${input}`} />
+            </label>
+            <label className="text-xs text-zinc-500">
+              类型
+              <select value={type} onChange={(e) => setType(e.target.value as never)} className={`mt-1 ${input}`}>
+                <option value="bad_case">bad_case（禁止写法）</option>
+                <option value="rule">rule（需结合上下文）</option>
+              </select>
+            </label>
+          </div>
+          <label className="text-xs text-zinc-500">
+            名称
+            <input value={name} onChange={(e) => setName(e.target.value)} className={`mt-1 ${input}`} />
+          </label>
+          <div className="flex gap-3">
+            <label className="text-xs text-zinc-500">
+              严重度
+              <select value={severity} onChange={(e) => setSeverity(e.target.value as never)} className={`mt-1 ${input}`}>
+                {SEVERITIES.map((s) => (
+                  <option key={s} value={s}>{SEVERITY_LABEL[s]}</option>
+                ))}
+              </select>
+            </label>
+            <label className="flex-1 text-xs text-zinc-500">
+              触发器符号（逗号分隔，词边界匹配新增行）
+              <input value={symbols} onChange={(e) => setSymbols(e.target.value)} placeholder="eval, new Function" className={`mt-1 font-mono ${input}`} />
+            </label>
+          </div>
+          <label className="text-xs text-zinc-500">
+            规则说明
+            <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={4} className={`mt-1 ${input}`} />
+          </label>
+          <div className="flex gap-3">
+            <label className="flex-1 text-xs text-zinc-500">
+              bad 示例（预填命中行）
+              <textarea value={bad} onChange={(e) => setBad(e.target.value)} rows={2} className={`mt-1 font-mono text-xs ${input}`} />
+            </label>
+            <label className="flex-1 text-xs text-zinc-500">
+              good 示例（推荐写法）
+              <textarea value={good} onChange={(e) => setGood(e.target.value)} rows={2} className={`mt-1 font-mono text-xs ${input}`} />
+            </label>
+          </div>
+
+          {error && <ErrorText>{error}</ErrorText>}
+
+          <div className="mt-1 flex justify-end gap-2">
+            <button onClick={onClose} className="rounded-lg border border-zinc-200 px-4 py-2 text-sm text-zinc-600 hover:border-zinc-400">
+              取消
+            </button>
+            <button
+              onClick={save}
+              disabled={busy}
+              className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-40"
+            >
+              {busy ? '保存中…' : '保存规则'}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
@@ -422,6 +612,7 @@ function IssueList({
   onToggleSelect,
   onIssueStatus,
   onGotoDiff,
+  onSaveRule,
   running,
   foundSoFar
 }: {
@@ -431,8 +622,9 @@ function IssueList({
   expandedId: number | null
   onExpand: (id: number | null) => void
   onToggleSelect: (id: number) => void
-  onIssueStatus: (id: number, status: string) => void
+  onIssueStatus: (id: number, status: string, reason?: string) => void
   onGotoDiff: (it: Issue) => void
+  onSaveRule: (it: Issue) => void
   running: boolean
   foundSoFar: number
 }) {
@@ -503,7 +695,8 @@ function IssueList({
                 rules={rules}
                 selected={selectedIds.has(it.id)}
                 onToggleSelect={() => onToggleSelect(it.id)}
-                onStatus={(s) => onIssueStatus(it.id, s)}
+                onStatus={(s, reason) => onIssueStatus(it.id, s, reason)}
+                onSaveRule={onSaveRule}
               />
             </div>
           )}

@@ -7,7 +7,7 @@ import type { ProjectCtx } from './ProjectLayout'
 
 /** 项目扫描配置：范围限定 / 排除 / 白名单豁免 / 评审文件数上限 */
 
-const HINTS: Record<keyof Omit<ScanConfig, 'maxFiles'>, { title: string; desc: string; placeholder: string }> = {
+const HINTS: Record<'include' | 'exclude' | 'allowlist', { title: string; desc: string; placeholder: string }> = {
   include: {
     title: '扫描范围（include）',
     desc: '留空 = 扫描全部变更文件。填写后只有匹配的文件参与扫描，其余视为排除。',
@@ -33,6 +33,9 @@ export default function ScanConfigPage() {
   const [exclude, setExclude] = useState('')
   const [allowlist, setAllowlist] = useState('')
   const [maxFiles, setMaxFiles] = useState(40)
+  const [notifyEnabled, setNotifyEnabled] = useState(false)
+  const [notifyUrl, setNotifyUrl] = useState('http://localhost:8090')
+  const [notifyTopic, setNotifyTopic] = useState('code-sentinel')
   const [error, setError] = useState('')
   const [saved, setSaved] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -45,6 +48,9 @@ export default function ScanConfigPage() {
         setExclude(c.exclude.join('\n'))
         setAllowlist(c.allowlist.join('\n'))
         setMaxFiles(c.maxFiles)
+        setNotifyEnabled(c.notify?.enabled === true)
+        setNotifyUrl(c.notify?.url || 'http://localhost:8090')
+        setNotifyTopic(c.notify?.topic || 'code-sentinel')
       })
       .catch((e) => setError(errMessage(e)))
   }, [id])
@@ -64,7 +70,8 @@ export default function ScanConfigPage() {
         include: toArr(include),
         exclude: toArr(exclude),
         allowlist: toArr(allowlist),
-        maxFiles: Number(maxFiles) || 40
+        maxFiles: Number(maxFiles) || 40,
+        notify: { enabled: notifyEnabled, url: notifyUrl, topic: notifyTopic }
       })
       setConfig(c)
       setSaved(true)
@@ -118,6 +125,42 @@ export default function ScanConfigPage() {
             onChange={(e) => setMaxFiles(Number(e.target.value))}
             className="w-28 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm outline-none focus:border-zinc-500"
           />
+        </div>
+
+        <div className="rounded-xl border border-zinc-200 bg-white p-4">
+          <div className="mb-1 flex items-center gap-2">
+            <span className="text-sm font-medium text-zinc-700">扫描完成通知（ntfy）</span>
+            <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-xs text-zinc-500">
+              <input type="checkbox" checked={notifyEnabled} onChange={(e) => setNotifyEnabled(e.target.checked)} className="accent-zinc-800" />
+              启用
+            </label>
+          </div>
+          <div className="mb-2.5 text-xs leading-relaxed text-zinc-400">
+            扫描结束（完成 / 停止 / 失败）时推送一条消息到 ntfy 服务器，手机可订阅接收。失败静默不影响扫描。
+          </div>
+          <div className="flex gap-3">
+            <label className="flex-1 text-xs text-zinc-500">
+              ntfy 服务器
+              <input
+                value={notifyUrl}
+                onChange={(e) => setNotifyUrl(e.target.value)}
+                placeholder="http://localhost:8090"
+                className={`mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-zinc-500 ${notifyEnabled ? '' : 'opacity-50'}`}
+                disabled={!notifyEnabled}
+                onBlur={(e) => setNotifyUrl(e.target.value.replace(/\/+$/, ''))}
+              />
+            </label>
+            <label className="w-44 text-xs text-zinc-500">
+              主题
+              <input
+                value={notifyTopic}
+                onChange={(e) => setNotifyTopic(e.target.value)}
+                placeholder="code-sentinel"
+                className={`mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-zinc-500 ${notifyEnabled ? '' : 'opacity-50'}`}
+                disabled={!notifyEnabled}
+              />
+            </label>
+          </div>
         </div>
 
         <div className="rounded-xl border border-zinc-100 bg-zinc-50/60 p-4 text-xs leading-relaxed text-zinc-500">

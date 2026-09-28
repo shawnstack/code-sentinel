@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import { apiDelete, apiGet, apiPost, errMessage } from '../api'
 import type { Project } from '../types'
 import { timeAgo } from '../severity'
-import { Empty, ErrorText, Spinner } from '../components/ui'
+import { Empty, ErrorText, Spinner, StatusBadge } from '../components/ui'
 import FolderPicker from '../components/FolderPicker'
 
 interface PickResult {
@@ -150,8 +150,28 @@ export default function Projects() {
                 <Link to={`/p/${p.id}`} className="flex-1">
                   <div className="font-medium text-zinc-900 group-hover:underline">{p.name}</div>
                   <div className="mt-0.5 font-mono text-xs text-zinc-500">{p.path}</div>
-                  <div className="mt-1 text-xs text-zinc-400">
-                    {p.scan_count ? `${p.scan_count} 次扫描 · 最近 ${timeAgo(p.last_scan_at)}` : '尚未扫描'}
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-zinc-400">
+                    {p.scan_count ? (
+                      <>
+                        <span>{p.scan_count} 次扫描 · 最近 {timeAgo(p.last_scan_at)}</span>
+                        {p.last_scan_status && <StatusBadge status={p.last_scan_status} />}
+                        {p.last_scan_status === 'done' &&
+                          (p.open_issues ? (
+                            <span className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-medium text-red-600">
+                              {p.open_issues} 个待处理
+                            </span>
+                          ) : (
+                            <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">无待处理</span>
+                          ))}
+                        {!!p.waiver_count && (
+                          <span className="text-[11px] text-zinc-400" title="历史 wont_fix 豁免记录数">
+                            {p.waiver_count} 项豁免
+                          </span>
+                        )}
+                      </>
+                    ) : (
+                      <span>尚未扫描</span>
+                    )}
                   </div>
                 </Link>
                 <button
